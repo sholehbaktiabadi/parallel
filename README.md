@@ -17,9 +17,14 @@ parallel.RunWith(opt, fn1, fn2)
 parallel.MapWith(opt, items, fn)
 ```
 
-Four functions, one struct, three sentinel errors. The entire implementation is a single
-file ([`parallel.go`](parallel.go)) written to be read — if you have never written a
-goroutine before, reading it is the point.
+Four functions, one struct, three sentinel errors, all in a single file
+([`parallel.go`](parallel.go)).
+
+That file is production code, not a tutorial: alongside the fan-out it also handles panic
+recovery, cancellation and tasks that exit abnormally. If what you want is to understand
+*why* fanning out this way is safe rather than just use it, read
+[How it works](#how-it-works) — that is the short version, and it is the part worth
+reading first.
 
 ## Install
 
@@ -27,7 +32,8 @@ goroutine before, reading it is the point.
 go get github.com/sholehbaktiabadi/parallel
 ```
 
-Requires Go 1.22 or newer.
+Requires Go 1.22 or newer. See [CHANGELOG.md](CHANGELOG.md) if you used the module before
+it was tagged — `RunWith` and `MapWith` changed signature in v0.1.0.
 
 ## Before and after
 
@@ -116,6 +122,16 @@ Two things worth knowing:
 - **You still get the successful results when something fails.** Failed positions hold the
   zero value, and the error tells you what went wrong. One bad URL does not throw away the
   other 99.
+
+And one thing to watch before you call it: **`Map` starts one goroutine per item, with no
+limit.** Over a slice of 50,000 database rows that is 50,000 goroutines and 50,000
+concurrent queries — enough to exhaust a connection pool or knock over whatever you are
+calling. `Map` is for short, known-size lists. As soon as the length comes from a query, a
+request body, or anything else you do not control, use `MapWith` with a `Limit`:
+
+```go
+parallel.MapWith(parallel.Options{Limit: 10}, ids, fetchUser)
+```
 
 ## Options, and the context your function is given
 
@@ -256,10 +272,26 @@ for i, s := range sources {
 }
 ```
 
-**What errgroup still does that this does not:** submit work dynamically. `g.Go` can be
-called at any time, including from inside another task as it discovers more work. This
-library takes a fixed list of functions or a fixed slice up front. If you need a growing
-work queue, use errgroup.
+## When errgroup is the better choice
+
+This library does not replace `errgroup` everywhere, and a section titled "Replacing
+errgroup" should be honest about where it loses.
+
+**When the work is not known up front.** `g.Go` can be called at any time, including from
+inside a running task that has just discovered more work. This library takes a fixed list of
+functions, or a fixed slice, before it starts. A crawler, a queue drainer, or anything
+recursive wants errgroup.
+
+**When you are teaching someone Go, not just shipping.** `errgroup` is maintained by the Go
+team and turns up in a great many codebases. A junior who learns it carries that knowledge
+to every job they will ever have; what they learn here only helps in projects that adopted
+this library. That is a real cost, and worth paying only where the benefit below is real.
+
+**Where this library genuinely wins** is the shape it was built for: a fixed collection, the
+same operation on each item, results collected in order. `errgroup` gives you `g.Go` and
+leaves the results to you — which is why that pattern so often grows a `sync.Mutex` or a
+shared slice that you have to reason about. `Map` removes the decision entirely. If your
+code does not have that shape, the advantage mostly disappears and `errgroup` is fine.
 
 ## Gotchas
 
@@ -285,16 +317,14 @@ out, err := parallel.Map(items, func(it Item) (int, error) {
 
 Run your tests with `-race`. It catches this immediately.
 
-**There is no limit by default.** `parallel.Map` starts one goroutine per item. With 200
-items that is 200 goroutines and 200 simultaneous requests to whatever you are calling.
-This is deliberate — a hidden default would be surprising — but it means you should set a
-limit whenever the slice can be large:
+**Why there is no limit by default.** The warning is up in the [Map](#map) section; this is
+the reasoning behind it. A built-in default would have to be a guess: `NumCPU` is right for
+work that burns CPU and far too low for work that waits on the network, and either way it
+would throttle your program silently, which is a miserable thing to debug. So the default
+does exactly what you wrote and nothing more, and picking a limit is left to you — because
+only you know what is on the other end of the call.
 
-```go
-parallel.MapWith(parallel.Options{Limit: 10}, ids, fetchUser)
-```
-
-From [`examples/limit`](examples/limit):
+Measured, from [`examples/limit`](examples/limit):
 
 ```
 == no limit ==
