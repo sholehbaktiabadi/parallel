@@ -1,3 +1,3 @@
 module github.com/sholehbaktiabadi/parallel
 
-go 1.25
+go 1.22

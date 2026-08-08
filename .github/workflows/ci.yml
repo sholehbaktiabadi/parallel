@@ -10,9 +10,11 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        # 1.25 is the version declared in go.mod - if the library ever stops
-        # building on it, the README's "Requires Go 1.25 or newer" is a lie.
-        go: ["1.25", "stable"]
+        # 1.22 is the version declared in go.mod. Testing it is the only thing
+        # that keeps the floor honest: the library is deliberately buildable on
+        # older toolchains, and it is very easy to break that by accident (for
+        # example by "simplifying" wg.Add/wg.Done into wg.Go, which needs 1.25).
+        go: ["1.22", "stable"]
     steps:
       - uses: actions/checkout@v4
 

@@ -7,6 +7,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"sync/atomic"
 	"time"
@@ -36,7 +37,7 @@ func fetchAll(opt parallel.Options, ids []int) (peak int64, took time.Duration, 
 
 	start := time.Now()
 
-	_, err = parallel.MapWith(opt, ids, func(id int) (string, error) {
+	_, err = parallel.MapWith(opt, ids, func(_ context.Context, id int) (string, error) {
 		now := inFlight.Add(1)
 		trackHighest(&highest, now)
 

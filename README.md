@@ -9,9 +9,17 @@ parallel.Run(fn1, fn2, fn3)  // run these together, wait for all of them
 parallel.Map(items, fn)      // run fn on every item together, collect the results
 ```
 
-Everything else is one struct with three fields and three sentinel errors. The entire
-implementation is a single file ([`parallel.go`](parallel.go)) written to be read — if you
-have never written a goroutine before, reading it is the point.
+When you need control — a concurrency limit, cancellation, fail-fast — the same two
+functions take an `Options` and hand your function a `context.Context`:
+
+```go
+parallel.RunWith(opt, fn1, fn2)
+parallel.MapWith(opt, items, fn)
+```
+
+Four functions, one struct, three sentinel errors. The entire implementation is a single
+file ([`parallel.go`](parallel.go)) written to be read — if you have never written a
+goroutine before, reading it is the point.
 
 ## Install
 
@@ -19,7 +27,7 @@ have never written a goroutine before, reading it is the point.
 go get github.com/sholehbaktiabadi/parallel
 ```
 
-Requires Go 1.25 or newer (the library uses `sync.WaitGroup.Go`).
+Requires Go 1.22 or newer.
 
 ## Before and after
 
@@ -109,21 +117,40 @@ Two things worth knowing:
   zero value, and the error tells you what went wrong. One bad URL does not throw away the
   other 99.
 
-## Options
+## Options, and the context your function is given
 
-`RunWith` and `MapWith` take an `Options` value:
+`RunWith` and `MapWith` take an `Options` value, and pass a `context.Context` into your
+function:
 
 ```go
-codes, err := parallel.MapWith(parallel.Options{Limit: 10}, urls, fetch)
+codes, err := parallel.MapWith(
+    parallel.Options{Limit: 10, Context: ctx, StopOnError: true},
+    urls,
+    func(ctx context.Context, u string) (int, error) {
+        req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+        if err != nil {
+            return 0, err
+        }
+        resp, err := http.DefaultClient.Do(req)
+        if err != nil {
+            return 0, err
+        }
+        defer resp.Body.Close()
+        return resp.StatusCode, nil
+    },
+)
 ```
 
 | Field         | Default | What it does |
 |---------------|---------|--------------|
 | `Limit`       | `0`     | Maximum number of functions running at the same time. **Zero or less means no limit.** |
-| `Context`     | `nil`   | Skip the tasks that have not started yet once the context is cancelled. Only has teeth together with `Limit` — see below. |
-| `StopOnError` | `false` | Stop starting new functions as soon as one returns an error. Skipped tasks are reported as `ErrStopped`. Only has teeth together with `Limit` — see below. |
+| `Context`     | `nil`   | Cancels the run. Tasks that have not started are skipped; running tasks get a cancelled context. |
+| `StopOnError` | `false` | Stop as soon as one function fails. Skipped tasks are reported as `ErrStopped`, and running tasks get a cancelled context. |
 
-The zero value `Options{}` is exactly what `Run` and `Map` use.
+That context is the whole point of `RunWith`/`MapWith`. Go cannot kill a running function
+from the outside — but if you pass the context you are given into whatever you call, your
+work stops itself. `Run` and `Map` keep the simpler signature for when you do not need any
+of this.
 
 ## Errors
 
@@ -144,6 +171,95 @@ if errors.Is(err, parallel.ErrPanic) {
 A batch stopped by **your** context reports `context.Canceled` / `context.DeadlineExceeded`.
 A batch stopped by `StopOnError` reports `ErrStopped`. They are deliberately different, so
 "my caller went away" never looks like "one of my tasks failed".
+
+## Replacing errgroup
+
+`RunWith` / `MapWith` with `StopOnError: true` is what `errgroup.WithContext` gives you:
+a bounded pool, first-failure cancellation, and a context that reaches the running work.
+
+**Fan out over a slice, keeping the results in order.** With errgroup you allocate the
+result slice yourself and index into it:
+
+```go
+result := make([]Out, len(items))
+g, gctx := errgroup.WithContext(ctx)
+g.SetLimit(8)
+for i, it := range items {
+    g.Go(func() error {
+        v, err := fetch(gctx, it)
+        if err != nil {
+            return err
+        }
+        result[i] = v
+        return nil
+    })
+}
+if err := g.Wait(); err != nil {
+    return nil, err
+}
+```
+
+With `MapWith` the slice and the indexing disappear:
+
+```go
+result, err := parallel.MapWith(
+    parallel.Options{Limit: 8, Context: ctx, StopOnError: true},
+    items,
+    func(ctx context.Context, it In) (Out, error) { return fetch(ctx, it) },
+)
+if err != nil {
+    return nil, err
+}
+```
+
+**Fan out into a map.** This is where errgroup usually forces a mutex:
+
+```go
+var mu sync.Mutex
+grouped := make(map[string][]Article)
+g := new(errgroup.Group)
+for source, url := range links {
+    g.Go(func() error {
+        articles, err := fetch(url)
+        if err != nil {
+            return err
+        }
+        mu.Lock()
+        grouped[source] = articles
+        mu.Unlock()
+        return nil
+    })
+}
+if err := g.Wait(); err != nil {
+    return nil, err
+}
+```
+
+Map over the keys instead and **the mutex is gone**, because each goroutine only ever
+writes to its own index:
+
+```go
+sources := make([]string, 0, len(links))
+for s := range links {
+    sources = append(sources, s)
+}
+
+fetched, err := parallel.Map(sources, func(s string) ([]Article, error) {
+    return fetch(links[s])
+})
+if err != nil {
+    return nil, err
+}
+grouped := make(map[string][]Article, len(sources))
+for i, s := range sources {
+    grouped[s] = fetched[i]
+}
+```
+
+**What errgroup still does that this does not:** submit work dynamically. `g.Go` can be
+called at any time, including from inside another task as it discovers more work. This
+library takes a fixed list of functions or a fixed slice up front. If you need a growing
+work queue, use errgroup.
 
 ## Gotchas
 
@@ -187,38 +303,10 @@ From [`examples/limit`](examples/limit):
   peak concurrency: 10
 ```
 
-**`Context` and `StopOnError` only skip tasks that have not started yet.** Without a `Limit`
-nothing waits in a queue — every task starts as fast as the loop can start it — so for a
-small batch both options usually arrive with nothing left to skip. If you want a deadline or
-fail-fast to actually bite, pair it with a `Limit`:
-
-```go
-parallel.MapWith(parallel.Options{Limit: 10, Context: ctx}, ids, fetchUser)
-```
-
-**Cancelling does not kill work that is already running.** Nothing in Go can stop a
-running function from the outside. If you want a running job to give up too, watch the
-context inside your own function:
-
-```go
-ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-defer cancel()
-
-err := parallel.RunWith(parallel.Options{Context: ctx},
-    func() error {
-        req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil) // <- ctx goes in here
-        if err != nil {
-            return err
-        }
-        resp, err := http.DefaultClient.Do(req)
-        if err != nil {
-            return err
-        }
-        defer resp.Body.Close()
-        return nil
-    },
-)
-```
+**`Run` and `Map` cannot stop work that has already started.** They give your function no
+context, so a cancelled batch can only skip tasks that have not begun. If you need running
+work to wind down, that is exactly what `RunWith` / `MapWith` are for — use the context
+they hand you.
 
 **A panic becomes an error.** If one of your functions panics, the program does not crash.
 You get back an error matching `errors.Is(err, parallel.ErrPanic)`, with the panic value and
@@ -255,8 +343,9 @@ The whole trick is that nothing is ever shared between two goroutines.
    tasks into a 17 MB error message.
 
 5. **`StopOnError` reuses the same machinery.** A failing task cancels an internal context
-   derived from yours. Keeping your context separate is what lets the final error say
-   `ErrStopped` instead of pretending you cancelled.
+   derived from yours — and that derived context is the one your tasks were handed, which is
+   how running work finds out. Keeping your context separate is what lets the final error
+   say `ErrStopped` instead of pretending you cancelled.
 
 6. **`recover` per task.** Every task runs inside `safeCall`, which uses a deferred
    `recover()` and a named return value to turn a panic into an `ErrPanic`. The error slot is
@@ -266,21 +355,17 @@ The whole trick is that nothing is ever shared between two goroutines.
 7. **`errors.Join`** collapses the error slots into one error, skipping the `nil` ones and
    returning `nil` when everything succeeded.
 
+One deliberate non-simplification: the goroutines are started with `wg.Add(1)` and
+`defer wg.Done()` rather than `wg.Go`. `wg.Go` is nicer, but it arrived in Go 1.25, and
+keeping the floor at 1.22 is worth more than the two saved lines.
+
 ## Examples
 
 ```bash
 go run ./examples/basic    # Run and Map, ordering, partial results
 go run ./examples/limit    # what Limit actually does, measured
-go run ./examples/cancel   # deadlines, StopOnError, cooperative cancellation
+go run ./examples/cancel   # deadlines, StopOnError, stopping work already running
 ```
-
-## When to use something else
-
-Reach for [`golang.org/x/sync/errgroup`](https://pkg.go.dev/golang.org/x/sync/errgroup)
-instead when you need to hand a context to each task, when you want the group's
-cancellation wired into long-running services, or when you want to start tasks dynamically
-as earlier ones discover more work. `errgroup` is the more powerful tool; this library is
-the one you can explain to a new engineer in five minutes.
 
 ## Tests
 

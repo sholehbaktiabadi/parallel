@@ -206,6 +206,139 @@ func TestMap_ReturnsPartialResults(t *testing.T) {
 	}
 }
 
+// --- the context handed to tasks -------------------------------------------
+//
+// These are the tests that make this library a drop-in replacement for
+// errgroup.WithContext. If run() ever stops threading its context down into the
+// task, every one of them fails.
+
+func TestRunWith_StopOnErrorCancelsRunningTasks(t *testing.T) {
+	errBoom := errors.New("boom")
+
+	failed := make(chan struct{})
+	var observed atomic.Bool
+
+	err := parallel.RunWith(parallel.Options{StopOnError: true},
+		func(ctx context.Context) error {
+			<-failed // wait until the other task has definitely failed
+			select {
+			case <-ctx.Done():
+				observed.Store(true)
+				return nil
+			case <-time.After(5 * time.Second):
+				return errors.New("this task's context was never cancelled")
+			}
+		},
+		func(ctx context.Context) error {
+			close(failed)
+			return errBoom
+		},
+	)
+
+	if !errors.Is(err, errBoom) {
+		t.Fatalf("RunWith() error = %v, want errBoom", err)
+	}
+	if !observed.Load() {
+		t.Error("a running task was never told that the run had given up; StopOnError did not reach it")
+	}
+}
+
+func TestMapWith_StopOnErrorCancelsRunningTasks(t *testing.T) {
+	errBoom := errors.New("boom")
+
+	failed := make(chan struct{})
+	var observed atomic.Bool
+
+	// MapWith must thread the context down too, not just RunWith.
+	_, err := parallel.MapWith(parallel.Options{StopOnError: true}, []int{0, 1},
+		func(ctx context.Context, n int) (int, error) {
+			if n == 1 {
+				close(failed)
+				return 0, errBoom
+			}
+			<-failed
+			select {
+			case <-ctx.Done():
+				observed.Store(true)
+				return 0, nil
+			case <-time.After(5 * time.Second):
+				return 0, errors.New("this item's context was never cancelled")
+			}
+		},
+	)
+
+	if !errors.Is(err, errBoom) {
+		t.Fatalf("MapWith() error = %v, want errBoom", err)
+	}
+	if !observed.Load() {
+		t.Error("a running item was never told that the run had given up")
+	}
+}
+
+func TestRunWith_CallerCancelReachesRunningTasks(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	running := make(chan struct{})
+	var observed atomic.Bool
+
+	go func() {
+		<-running
+		cancel()
+	}()
+
+	err := parallel.RunWith(parallel.Options{Context: ctx},
+		func(taskCtx context.Context) error {
+			close(running)
+			select {
+			case <-taskCtx.Done():
+				observed.Store(true)
+				return nil
+			case <-time.After(5 * time.Second):
+				return errors.New("the caller's cancellation never reached this task")
+			}
+		},
+	)
+
+	if err != nil {
+		t.Fatalf("RunWith() error = %v, want nil", err)
+	}
+	if !observed.Load() {
+		t.Error("Options.Context was not handed to the task")
+	}
+}
+
+func TestRunWith_WithoutStopOnErrorTasksAreLeftAlone(t *testing.T) {
+	errBoom := errors.New("boom")
+
+	failed := make(chan struct{})
+	var cancelled atomic.Bool
+
+	// StopOnError is off, so one task failing must NOT cut short the others.
+	err := parallel.RunWith(parallel.Options{},
+		func(ctx context.Context) error {
+			<-failed
+			if ctx.Err() != nil {
+				cancelled.Store(true)
+			}
+			return nil
+		},
+		func(ctx context.Context) error {
+			close(failed)
+			return errBoom
+		},
+	)
+
+	if !errors.Is(err, errBoom) {
+		t.Fatalf("RunWith() error = %v, want errBoom", err)
+	}
+	if cancelled.Load() {
+		t.Error("a healthy task was cancelled by another task's failure although StopOnError is off")
+	}
+}
+
+// ---------------------------------------------------------------------------
+
 func TestMapWith_RespectsLimit(t *testing.T) {
 	const limit = 3
 
@@ -213,7 +346,7 @@ func TestMapWith_RespectsLimit(t *testing.T) {
 
 	items := make([]int, 30)
 
-	_, err := parallel.MapWith(parallel.Options{Limit: limit}, items, func(int) (int, error) {
+	_, err := parallel.MapWith(parallel.Options{Limit: limit}, items, func(_ context.Context, _ int) (int, error) {
 		now := inFlight.Add(1)
 		for { // remember the highest concurrency we ever observed
 			max := peak.Load()
@@ -245,7 +378,7 @@ func TestMapWith_LimitZeroIsUnlimited(t *testing.T) {
 	// introduced, fewer than n tasks would run together and the barrier would time out.
 	block := barrier(n)
 
-	_, err := parallel.MapWith(parallel.Options{Limit: 0}, make([]int, n), func(int) (int, error) {
+	_, err := parallel.MapWith(parallel.Options{Limit: 0}, make([]int, n), func(_ context.Context, _ int) (int, error) {
 		return 0, block()
 	})
 
@@ -260,9 +393,9 @@ func TestRunWith_NegativeLimit(t *testing.T) {
 	// A negative Limit is documented the same as zero: no limit.
 	block := barrier(n)
 
-	fns := make([]func() error, n)
+	fns := make([]func(context.Context) error, n)
 	for i := range fns {
-		fns[i] = block
+		fns[i] = func(context.Context) error { return block() }
 	}
 
 	if err := parallel.RunWith(parallel.Options{Limit: -5}, fns...); err != nil {
@@ -275,9 +408,9 @@ func TestRunWith_StopOnError(t *testing.T) {
 
 	var ran atomic.Int64
 
-	fns := make([]func() error, 50)
+	fns := make([]func(context.Context) error, 50)
 	for i := range fns {
-		fns[i] = func() error {
+		fns[i] = func(context.Context) error {
 			ran.Add(1)
 			if i == 0 {
 				return errBoom
@@ -322,9 +455,9 @@ func TestRunWith_LateCallerCancelDoesNotStealTheBlame(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()
 
-	fns := make([]func() error, 10)
+	fns := make([]func(context.Context) error, 10)
 	for i := range fns {
-		fns[i] = func() error {
+		fns[i] = func(context.Context) error {
 			if i == 1 {
 				return errBoom // fails at once, long before the deadline
 			}
@@ -354,9 +487,9 @@ func TestRunWith_LateCallerCancelDoesNotStealTheBlame(t *testing.T) {
 func TestRunWith_GoexitTriggersStopOnError(t *testing.T) {
 	var ran atomic.Int64
 
-	fns := make([]func() error, 50)
+	fns := make([]func(context.Context) error, 50)
 	for i := range fns {
-		fns[i] = func() error {
+		fns[i] = func(context.Context) error {
 			ran.Add(1)
 			if i == 0 {
 				runtime.Goexit() // never returns, so the end of this func is unreachable
@@ -393,9 +526,10 @@ func TestRunWith_LimitWithCancelledContext(t *testing.T) {
 	for range 200 {
 		var ran atomic.Int64
 
-		fns := make([]func() error, 20)
+		fns := make([]func(context.Context) error, 20)
 		for i := range fns {
-			fns[i] = func() error { ran.Add(1); return nil }
+			_ = i
+			fns[i] = func(context.Context) error { ran.Add(1); return nil }
 		}
 
 		err := parallel.RunWith(parallel.Options{Limit: 4, Context: ctx}, fns...)
@@ -415,9 +549,9 @@ func TestRunWith_LimitWithCancelledContext(t *testing.T) {
 func TestRunWith_StopOnErrorWithoutFailures(t *testing.T) {
 	var ran atomic.Int64
 
-	fns := make([]func() error, 20)
+	fns := make([]func(context.Context) error, 20)
 	for i := range fns {
-		fns[i] = func() error { ran.Add(1); return nil }
+		fns[i] = func(context.Context) error { ran.Add(1); return nil }
 	}
 
 	// Nothing fails, so StopOnError must stay completely out of the way.
@@ -434,9 +568,9 @@ func TestRunWith_StopOnErrorWithoutFailures(t *testing.T) {
 func TestRunWith_SkippedTasksReportedOnce(t *testing.T) {
 	errBoom := errors.New("boom")
 
-	fns := make([]func() error, 10_000)
+	fns := make([]func(context.Context) error, 10_000)
 	for i := range fns {
-		fns[i] = func() error {
+		fns[i] = func(context.Context) error {
 			if i == 0 {
 				return errBoom
 			}
@@ -465,7 +599,7 @@ func TestMapWith_StopOnError(t *testing.T) {
 	items := make([]int, 500)
 
 	// MapWith must honour StopOnError, not just Limit.
-	_, err := parallel.MapWith(parallel.Options{Limit: 1, StopOnError: true}, items, func(int) (int, error) {
+	_, err := parallel.MapWith(parallel.Options{Limit: 1, StopOnError: true}, items, func(_ context.Context, _ int) (int, error) {
 		if ran.Add(1) == 1 {
 			return 0, errBad
 		}
@@ -491,7 +625,7 @@ func TestMapWith_Context(t *testing.T) {
 	var ran atomic.Int64
 
 	// MapWith must honour Context, not just Limit.
-	results, err := parallel.MapWith(parallel.Options{Context: ctx}, []int{1, 2, 3}, func(n int) (int, error) {
+	results, err := parallel.MapWith(parallel.Options{Context: ctx}, []int{1, 2, 3}, func(_ context.Context, n int) (int, error) {
 		ran.Add(1)
 		return n, nil
 	})
@@ -516,8 +650,8 @@ func TestRunWith_ContextCancel(t *testing.T) {
 	var ran atomic.Int64
 
 	err := parallel.RunWith(parallel.Options{Context: ctx},
-		func() error { ran.Add(1); return nil },
-		func() error { ran.Add(1); return nil },
+		func(context.Context) error { ran.Add(1); return nil },
+		func(context.Context) error { ran.Add(1); return nil },
 	)
 
 	if !errors.Is(err, context.Canceled) {
@@ -542,9 +676,9 @@ func TestRunWith_ContextDeadline(t *testing.T) {
 
 	var ran atomic.Int64
 
-	fns := make([]func() error, 10)
+	fns := make([]func(context.Context) error, 10)
 	for i := range fns {
-		fns[i] = func() error {
+		fns[i] = func(context.Context) error {
 			ran.Add(1)
 			time.Sleep(50 * time.Millisecond)
 			return nil
@@ -566,9 +700,9 @@ func TestRunWith_ContextDeadlineBeatsStopOnError(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
 
-	fns := make([]func() error, 10)
+	fns := make([]func(context.Context) error, 10)
 	for i := range fns {
-		fns[i] = func() error {
+		fns[i] = func(context.Context) error {
 			time.Sleep(50 * time.Millisecond)
 			return nil
 		}

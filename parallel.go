@@ -9,8 +9,9 @@
 // Both of them wait until everything is finished, and both of them give you back
 // a single error that contains every failure that happened.
 //
-// When you need more control (limit how many run at once, cancel early, stop on the
-// first error) use RunWith and MapWith with an Options value.
+// When you need more control - limit how many run at once, cancel early, stop on the
+// first error - use RunWith and MapWith with an Options value. Those two hand your
+// function a context.Context, so your work can stop itself when the run is cancelled.
 //
 // Your functions must be safe to call from several goroutines at once. That is the
 // one rule this library cannot enforce for you - see the README.
@@ -61,29 +62,15 @@ type Options struct {
 	Limit int
 
 	// Context lets you stop early. When it is cancelled (or its deadline passes),
-	// the tasks that have not started yet are skipped.
-	//
-	// Two things this does NOT do, both of which surprise people:
-	//
-	// Functions that are ALREADY running are never killed - Go cannot kill a
-	// running function from the outside. If you need to interrupt work in flight,
-	// use the context inside your own function too. See the README.
-	//
-	// Without a Limit there is nothing waiting in a queue, because every task
-	// starts as fast as the loop can start it. So for a small batch and Limit 0
-	// a cancellation usually arrives with nothing left to skip. Context has real
-	// teeth when it is combined with Limit.
+	// the tasks that have not started yet are skipped, and the context handed to
+	// the tasks that are already running is cancelled too.
 	//
 	// nil (the default) means "never cancel".
 	Context context.Context
 
-	// StopOnError makes the run stop starting new functions as soon as one of
-	// them returns an error. Functions that are already running still finish,
-	// and the skipped ones are reported as ErrStopped.
-	//
-	// Like Context, this only affects tasks that have not started yet, so it is
-	// only useful together with Limit. With Limit 0 every task has usually
-	// started before the first error arrives, and this option does nothing.
+	// StopOnError makes the run stop as soon as one function returns an error:
+	// tasks that have not started yet are skipped and reported as ErrStopped, and
+	// the context handed to the running tasks is cancelled so they can wind down.
 	//
 	// false (the default) means every function gets a chance to run, and you get
 	// all of their errors back together.
@@ -100,15 +87,24 @@ type Options struct {
 // If several functions fail you get all of their errors joined together, and
 // errors.Is / errors.As still work on the result.
 func Run(fns ...func() error) error {
-	return RunWith(Options{}, fns...)
+	return run(Options{}, len(fns), func(_ context.Context, i int) error {
+		return fns[i]()
+	})
 }
 
 // RunWith is Run with control over concurrency, cancellation and early stopping.
 //
-//	err := parallel.RunWith(parallel.Options{Limit: 2}, fns...)
-func RunWith(opt Options, fns ...func() error) error {
-	return run(opt, len(fns), func(i int) error {
-		return fns[i]()
+// Your functions are handed a context. It is cancelled when Options.Context is
+// cancelled, and - if Options.StopOnError is set - as soon as any function fails.
+// Pass it into whatever you call and your work stops itself:
+//
+//	err := parallel.RunWith(parallel.Options{Limit: 2, StopOnError: true},
+//	    func(ctx context.Context) error { return db.QueryContext(ctx, q1) },
+//	    func(ctx context.Context) error { return db.QueryContext(ctx, q2) },
+//	)
+func RunWith(opt Options, fns ...func(context.Context) error) error {
+	return run(opt, len(fns), func(ctx context.Context, i int) error {
+		return fns[i](ctx)
 	})
 }
 
@@ -131,18 +127,30 @@ func RunWith(opt Options, fns ...func() error) error {
 //
 // Note: Map starts one goroutine per item. For a large slice, use MapWith with a Limit.
 func Map[T, R any](items []T, fn func(T) (R, error)) ([]R, error) {
-	return MapWith(Options{}, items, fn)
+	return MapWith(Options{}, items, func(_ context.Context, item T) (R, error) {
+		return fn(item)
+	})
 }
 
 // MapWith is Map with control over concurrency, cancellation and early stopping.
 //
-//	// at most 10 downloads at the same time
-//	codes, err := parallel.MapWith(parallel.Options{Limit: 10}, urls, fetch)
-func MapWith[T, R any](opt Options, items []T, fn func(T) (R, error)) ([]R, error) {
+// Like RunWith, your function is handed a context that is cancelled when the run
+// is cancelled or - with StopOnError - when any item fails:
+//
+//	// at most 10 downloads at once, and they all give up as soon as one fails
+//	codes, err := parallel.MapWith(
+//	    parallel.Options{Limit: 10, Context: ctx, StopOnError: true},
+//	    urls,
+//	    func(ctx context.Context, u string) (int, error) {
+//	        req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+//	        ...
+//	    },
+//	)
+func MapWith[T, R any](opt Options, items []T, fn func(context.Context, T) (R, error)) ([]R, error) {
 	results := make([]R, len(items))
 
-	err := run(opt, len(items), func(i int) error {
-		r, err := fn(items[i])
+	err := run(opt, len(items), func(ctx context.Context, i int) error {
+		r, err := fn(ctx, items[i])
 		if err != nil {
 			return err
 		}
@@ -156,8 +164,8 @@ func MapWith[T, R any](opt Options, items []T, fn func(T) (R, error)) ([]R, erro
 }
 
 // run is the only place in this library where concurrency actually happens.
-// It executes n tasks, where task(i) does the i-th piece of work.
-func run(opt Options, n int, task func(i int) error) error {
+// It executes n tasks, where task(ctx, i) does the i-th piece of work.
+func run(opt Options, n int, task func(ctx context.Context, i int) error) error {
 	// One error slot per task. Like results in MapWith, every goroutine owns
 	// exactly one index, so no lock is required to fill this in.
 	errs := make([]error, n)
@@ -172,6 +180,9 @@ func run(opt Options, n int, task func(i int) error) error {
 
 	// stop() is what a failing task calls. Unless StopOnError is set it does nothing,
 	// which keeps the loop below free of if-statements.
+	//
+	// ctx is what the tasks themselves receive, so cancelling it is how a running
+	// task finds out that the rest of the run has given up.
 	ctx := parent
 	stop := func() {}
 	if opt.StopOnError {
@@ -213,9 +224,14 @@ func run(opt Options, n int, task func(i int) error) error {
 			break
 		}
 
-		// wg.Go starts the goroutine and handles the bookkeeping that used to be
-		// wg.Add(1) plus defer wg.Done() - one less thing to get wrong.
-		wg.Go(func() {
+		// Do NOT "simplify" this to wg.Go(func(){...}). Your editor and Go's
+		// waitgroupgo analyser will both suggest it, but wg.Go arrived in Go 1.25
+		// and this library deliberately builds on Go 1.22, so that projects still
+		// on an older toolchain can use it. Changing this breaks every one of them.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
 			if slots != nil {
 				defer func() { <-slots }() // give the seat back for the next task
 			}
@@ -233,8 +249,8 @@ func run(opt Options, n int, task func(i int) error) error {
 			// we put a placeholder in first. Without it, a task killed by
 			// runtime.Goexit (t.Fatal and friends) would be reported as a success.
 			errs[i] = ErrIncomplete
-			errs[i] = safeCall(task, i)
-		})
+			errs[i] = safeCall(ctx, task, i)
+		}()
 	}
 
 	// Nothing below this line runs until every goroutine above has finished, so by
@@ -277,7 +293,7 @@ func canStart(ctx context.Context, slots chan struct{}) bool {
 // Without this, a panic in any goroutine takes down the whole program - and the
 // stack trace points at our goroutine, not at the code that called us. Here the
 // panic becomes just another error you can check with errors.Is(err, ErrPanic).
-func safeCall(task func(i int) error, i int) (err error) {
+func safeCall(ctx context.Context, task func(context.Context, int) error, i int) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			// Named return value: assigning to err here changes what safeCall returns.
@@ -285,5 +301,5 @@ func safeCall(task func(i int) error, i int) (err error) {
 		}
 	}()
 
-	return task(i)
+	return task(ctx, i)
 }
