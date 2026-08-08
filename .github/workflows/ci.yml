@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # 1.25 is the version declared in go.mod - if the library ever stops
+        # building on it, the README's "Requires Go 1.25 or newer" is a lie.
+        go: ["1.25", "stable"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: test with the race detector
+        run: go test ./... -race -count=1
+
+      - name: run the examples
+        run: |
+          go run ./examples/basic
+          go run ./examples/limit
+          go run ./examples/cancel

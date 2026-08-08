@@ -1,0 +1,12 @@
+# Test binaries and coverage output
+*.test
+*.out
+
+# Editor / OS noise
+.idea/
+.vscode/
+.DS_Store
+
+# Go workspace files - keep them local
+go.work
+go.work.sum
